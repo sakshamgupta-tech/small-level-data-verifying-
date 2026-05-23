@@ -150,7 +150,9 @@ def chk_get_reference_users_for_server(rl: dict, sc: str) -> set:
     return set(rl[t]) if t in rl else set(rl.get("ALL", []))
 def chk_get_all_unique_users(xl: dict) -> set:
     u = set()
-    for df in xl.values():
+    for sn, df in xl.items():
+        if chk_normalize_sheet_key(sn) == "columnmapping":
+            continue
         col = chk_find_user_id_column(df)
         if col: u.update({chk_clean_user_id(x) for x in df[col].dropna() if chk_clean_user_id(x)})
     return u
@@ -177,6 +179,8 @@ def chk_validate_summary_sheets(xl: dict, rus: set):
     all_u = chk_get_all_unique_users(xl) if not rus else set(rus)
     sum_u = chk_get_summary_users(xl)
     for sn, df in xl.items():
+        if chk_normalize_sheet_key(sn) == "columnmapping":
+            continue
         col = chk_find_user_id_column(df)
         if col is None:
             skip.append(sn); res[sn] = {"status":"No User ID Col","missing":[],"extra":[]}
@@ -192,6 +196,8 @@ def chk_validate_expiry_sheets(xl: dict, se: str = None):
     if not se: return {}, []
     exp_val, res, f_iss, found = chk_normalize_expiry_value(se), {}, [], False
     for sn, df in xl.items():
+        if chk_normalize_sheet_key(sn) == "columnmapping":
+            continue
         col = chk_find_expiry_column(df)
         if not col: continue
         found = True
@@ -201,6 +207,68 @@ def chk_validate_expiry_sheets(xl: dict, se: str = None):
         res[sn] = {"status": "All match" if not mism else "Issue", "expected": se, "mismatches": mism, "column": col}
     if not found: f_iss.append(f"Expire column not found in Summary Excel. Checked sheets: {', '.join(xl.keys())}")
     return res, f_iss
+CHK_EXPECTED_SUMMARY_COLUMNS = {
+    "Users": ["SNO", "Enabled", "UserID", "Alias", "LoggedIn", "SqOff Done", "Broker", "Qty Multiplier", "MTM (All)", "ALLOCATION", "MAX_LOSS", "Available Margin", "Total Orders", "Total Lots", "SERVER", "ALGO", "REMARK", "OPERATOR", "EXPIRY", "DATE"],
+    "Strategy Tags": ["SNO", "Enabled", "Strategy Tag", "SqOff Done", "PNL", "Trade Value", "Total Orders", "Total Lots", "Total Portfolios", "Total Legs"],
+    "Portfolios": ["SNO", "Portfolio Name", "Exchange Symbol", "User ID", "User Alias", "Strategy Tag", "Status", "SqOff Done", "PNL", "PNL Per Lot", "CE PNL", "PE PNL", "Max PNL", "Min PNL", "Underlying Price", "Total Legs", "Max PNL Time", "Min PNL Time", "Total Orders", "Total Lots"],
+    "Legs": ["SNO", "Portfolio Name", "Exchange Symbol", "User ID", "User Alias", "Strategy Tag", "Leg SNO", "Leg ID", "Txn", "Lots", "Status", "Entry Time", "Entry Qty", "Entry Filled Qty", "Entry Avg Price", "Exit Time", "Exit Qty", "Exit Filled Qty", "Exit Avg Price", "Exit Type", "LTP", "PNL", "PNL Per Lot", "Total Orders", "Total Lots"],
+    "Order Book": ["SNO", "User ID", "User Alias", "Exchange", "Symbol", "Order ID", "Order Time", "Transaction", "Avg Price", "Quantity", "Filled Quantity", "Order Type", "Limit Price", "Trigger Price", "Exchg Order ID", "Exchg Order Time", "Product", "Status", "Tag", "Error Msg"],
+    "Positions": ["SNO", "User ID", "User Alias", "Product", "Exchange", "Symbol", "Net Qty", "LTP", "PNL", "PNL Percentage", "Buy Qty", "Buy Avg Price", "Buy Value", "Sell Qty", "Sell Avg Price", "Sell Value", "Realized Profit", "Unrealized Profit"],
+    "MultiLeg Orders": ["SNO", "User ID", "User Alias", "Portfolio Name", "Leg ID", "Exchange", "Symbol", "Order ID", "Order Time", "Transaction", "Avg Price", "Quantity", "Filled Quantity", "Product", "Order Type", "Limit Price", "Trigger Price", "Exchg Order ID", "Exchg Order Time", "Status", "Tag", "Remarks"],
+}
+def chk_build_default_summary_column_map(xl: dict) -> pd.DataFrame:
+    rows = []
+    present = {chk_normalize_sheet_key(sn): sn for sn in xl if chk_normalize_sheet_key(sn) != "columnmapping"}
+    for sheet, columns in CHK_EXPECTED_SUMMARY_COLUMNS.items():
+        if chk_normalize_sheet_key(sheet) not in present:
+            continue
+        for col in columns:
+            rows.append({"Sheet": present[chk_normalize_sheet_key(sheet)], "Summary File Column": col, "Mapped Field": col, "Used In Recon": "Expected"})
+    return pd.DataFrame(rows)
+def chk_build_summary_column_map(xl: dict) -> pd.DataFrame:
+    map_sheet = next((sn for sn in xl if chk_normalize_sheet_key(sn) == "columnmapping"), "")
+    if not map_sheet:
+        return chk_build_default_summary_column_map(xl)
+    mp = xl[map_sheet].copy()
+    sc = chk_find_column_by_name(mp, "Sheet Name")
+    cc = chk_find_column_by_name(mp, "Summary File Column")
+    mc = chk_find_column_by_name(mp, "Mapped Field")
+    uc = chk_find_column_by_name(mp, "Used In Recon")
+    if not sc or not cc:
+        return chk_build_default_summary_column_map(xl)
+    rows = []
+    for _, r in mp.iterrows():
+        sheet = str(r.get(sc, "")).strip()
+        col = str(r.get(cc, "")).strip()
+        if not sheet or not col or sheet.lower() in {"nan", "none"} or col.lower() in {"nan", "none"}:
+            continue
+        rows.append({
+            "Sheet": sheet,
+            "Summary File Column": col,
+            "Mapped Field": str(r.get(mc, "")).strip() if mc else "",
+            "Used In Recon": str(r.get(uc, "")).strip() if uc else "",
+        })
+    return pd.DataFrame(rows)
+def chk_validate_summary_columns(xl: dict):
+    mp = chk_build_summary_column_map(xl)
+    if mp.empty:
+        return pd.DataFrame(), []
+    rows = []
+    for sheet, grp in mp.groupby("Sheet", sort=False):
+        if sheet not in xl:
+            for _, r in grp.iterrows():
+                rows.append({**r.to_dict(), "Status": "Missing Sheet"})
+            continue
+        actual = {chk_normalize_sheet_key(c) for c in xl[sheet].columns}
+        for _, r in grp.iterrows():
+            rows.append({**r.to_dict(), "Status": "OK" if chk_normalize_sheet_key(r["Summary File Column"]) in actual else "Missing Column"})
+    df = pd.DataFrame(rows)
+    missing = df[df["Status"].ne("OK")].copy() if not df.empty else pd.DataFrame()
+    issues = []
+    for sheet, grp in missing.groupby("Sheet", sort=False):
+        cols = grp["Summary File Column"].astype(str).tolist()
+        issues.append(f"{sheet}: Missing mapped column(s): {', '.join(cols)}")
+    return df, issues
 def chk_extract_algo(f: str) -> str:
     n = f.rsplit(".", 1)[0]
     return n.split("_")[0] if "_" in n else n
@@ -219,17 +287,19 @@ def chk_check_summary_self_contained(sf, rl, ss=None, se=None):
             sum_u = chk_get_summary_users(xl)
             s_res, f_iss, skip = chk_validate_summary_sheets(xl, rus)
             e_res, e_iss = chk_validate_expiry_sheets(xl, se)
+            col_map, col_iss = chk_validate_summary_columns(xl)
             for sn, ed in e_res.items():
                 s_res.setdefault(sn, {"status":"All match","missing":[],"extra":[]})
                 if ed["status"] == "Issue": s_res[sn]["status"] = "Issue"
                 s_res[sn].update({"expiry_status":ed["status"],"expiry_expected":ed["expected"],"expiry_mismatches":ed["mismatches"],"expiry_column":ed["column"]})
             m_sum = sorted(rus - sum_u) if rus else []
             e_sum = sorted(sum_u - rus) if rus else []
-            tot = len(f_iss) + len(e_iss) + bool(m_sum) + bool(e_sum)
+            tot = len(f_iss) + len(e_iss) + len(col_iss) + bool(m_sum) + bool(e_sum)
             res.append({
                 "File": fn, "Server": fs, "Algo": algo, "ALGO": algo, "Summary Users ALGO": algo,
                 "Sheets": len(xl), "Total Unique Users": len(all_u), "Running Users (Same Server)": len(rus),
                 "Total Issues": tot, "Selected Expiry": se or "", "Expiry Issues": e_iss,
+                "Column Issues": col_iss, "column_mapping": col_map,
                 "sheet_results": s_res, "skipped_sheets": skip, "missing_in_summary": m_sum, "extra_in_summary": e_sum
             })
         except Exception as e: st.error(f"Failed to process {uf.name}: {e}")
@@ -259,6 +329,16 @@ def chk_build_validation_report_csv(nc: dict, ar: list) -> bytes:
                 "Missing": ", ".join(data["missing"]), "Extra": ", ".join(data["extra"]), "Issues": "", "Details": ed,
                 "Expiry": data.get("expiry_expected", ""), "Expiry Status": data.get("expiry_status", "")
             })
+        cm = res.get("column_mapping")
+        if isinstance(cm, pd.DataFrame) and not cm.empty:
+            for _, row in cm[cm["Status"].ne("OK")].iterrows():
+                rows.append({
+                    "Section": "Column Mapping", "File": res["File"], "Sheet": row.get("Sheet", ""),
+                    "Status": row.get("Status", ""), "Server": res["Server"], "Date": "",
+                    "Missing": row.get("Summary File Column", ""), "Extra": "",
+                    "Issues": row.get("Status", ""), "Details": f"Mapped Field={row.get('Mapped Field', '')}; Used In Recon={row.get('Used In Recon', '')}",
+                    "Expiry": res.get("Selected Expiry", ""), "Expiry Status": ""
+                })
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
 def chk_get_google_sheets_service(cf=None):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -715,6 +795,7 @@ class CheckerNamespace:
     find_user_id_column = staticmethod(chk_find_user_id_column)
     find_column_by_name = staticmethod(chk_find_column_by_name)
     find_expiry_column = staticmethod(chk_find_expiry_column)
+    validate_summary_columns = staticmethod(chk_validate_summary_columns)
     clean_report_text = staticmethod(chk_clean_report_text)
     normalize_expiry_value = staticmethod(chk_normalize_expiry_value)
     load_csv_from_upload = staticmethod(chk_load_csv_from_upload)
@@ -1021,6 +1102,8 @@ def render_summary_checker(files, selected_server, selected_expiry):
 
             for issue in result.get("Expiry Issues", []):
                 st.error(issue)
+            for issue in result.get("Column Issues", []):
+                st.error(issue)
 
             if result["missing_in_summary"]:
                 st.error(
@@ -1034,6 +1117,13 @@ def render_summary_checker(files, selected_server, selected_expiry):
                     + ", ".join(result["extra_in_summary"][:100])
                     + ("..." if len(result["extra_in_summary"]) > 100 else "")
                 )
+
+            column_map = result.get("column_mapping")
+            if isinstance(column_map, pd.DataFrame) and not column_map.empty:
+                missing_columns = column_map[column_map["Status"].ne("OK")]
+                if not missing_columns.empty:
+                    st.subheader("Missing Summary Columns")
+                    st.dataframe(missing_columns, width="stretch", hide_index=True)
 
             sheet_data = []
             for sheet, data in result["sheet_results"].items():
